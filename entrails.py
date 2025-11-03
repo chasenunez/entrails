@@ -71,6 +71,8 @@ DEFAULT_BUCKETS = [
     "https://os.zhdk.cloud.switch.ch/envicloud/",
     "https://os.zhdk.cloud.switch.ch/chelsav1/",
     "https://os.zhdk.cloud.switch.ch/chelsav2/",
+    "https://s3-zh.os.switch.ch/pointclouds",
+    "https://s3-zh.os.switch.ch/drone-data",
     "https://os.zhdk.cloud.switch.ch/edna/",
 ]
 
