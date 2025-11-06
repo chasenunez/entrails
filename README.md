@@ -44,7 +44,67 @@ To keep the visualizations meaningful, two filtering rules were added to the **f
 
 These rules are applied **while fetching** the S3 listings (i.e., excluded rows never get written to the CSV). This keeps the CSV smaller and the analysis honest.
 
-## Script Overview
+# ZIP Inspection — peek inside ZIP files without downloading them
+
+A lot of the files on Envidat are zip files and could contain anything. So I added functionality to *inspect the contents of remote ZIP archives* directly from the S3-style endpoints using HTTP **range** requests. This lets you learn what's inside large `.zip` files (file names, compressed sizes, compression method) without downloading the entire archive. Neat, efficient, and much kinder to your bandwidth quota.
+
+the [inspiration](https://stackoverflow.com/questions/51351000/read-zip-files-from-s3-without-downloading-the-entire-file) for this fix came from the stack overflow user Janaka Bandara
+
+## How it works
+
+* During `fetch`, when the crawler encounters a `.zip` file it will attempt to read the ZIP **End Of Central Directory (EOCD)** and the **Central Directory (CD)** via HTTP `Range` requests (two small ranged GETs).
+* The script builds a tiny “fake” ZIP in-memory from the CD + EOCD and feeds that to Python’s `zipfile.ZipFile` to enumerate entries.
+* For each inner entry found, the script writes an extra row to the CSV so inner files appear alongside normal files in your `all_s3_files.csv`.
+
+No full-archive download required in the common case.
+
+## What the fetch step writes
+
+### Original ZIP file row
+
+CSV columns remain the same as for normal objects:
+
+```
+bucket_url, bucket_name, key, last_modified, etag, size, storage_class, owner_id, owner_display_name, type
+...
+https://os.zhdk.cloud.switch.ch/envicloud/,envicloud,doi/1234/archive.zip,2025-07-01T..., "abcd", 123456789, STANDARD, ..., open-research-data, Normal
+```
+
+### Inner ZIP member rows
+
+For each member discovered inside the ZIP, an extra row is added using the `zip::innerpath` key convention and the compressed size from the ZIP central directory is placed in `size`:
+
+```
+https://os.zhdk.cloud.switch.ch/envicloud/,envicloud,doi/1234/archive.zip::data/measurement.csv,2025-07-01T..., "abcd", 1234, STANDARD, ..., open-research-data, Normal
+```
+
+> Note: `size` on inner rows is the **compressed size** (how many bytes the file consumes inside the ZIP).
+
+## Caveats & limitations
+
+1. **Requires server support for HTTP Range requests.**
+   If the server ignores `Range` and returns the full file (HTTP 200), the helper **will not** download very large archives (configurable safety threshold). It will log a warning and skip inspecting that ZIP.
+
+2. **ZIP64 and unusual ZIP structures.**
+   The fast approach assumes the EOCD (End Of Central Directory) is reachable in the last *~64 KiB* of the file. Very large or ZIP64 archives may place EOCD records elsewhere (or include ZIP64 structures). These cases are currently **skipped** (a warning is logged). We can add ZIP64 support if you have many such archives.
+
+3. **Performance & CSV growth.**
+   If a ZIP contains thousands of files, the CSV will grow proportionally. Expect extra time and disk usage if you inspect many big ZIPs. For large runs you may want to:
+
+   * Use `--max-pages` for testing,
+   * Run ZIP inspection on a subset first,
+   * Or add parallelism (future enhancement).
+
+4. **Compressed vs uncompressed sizes.**
+   The script records **compressed sizes** for inner entries (this reflects how many bytes are stored inside the ZIP). If you want to show uncompressed bytes in visualizations, we can easily switch to using the uncompressed (`file_size`) field instead.
+
+5. **No ZIP content extraction / security.**
+   This method only lists filenames and sizes; it does **not** extract or execute any payloads. It’s safe from running arbitrary code inside archives.
+
+6. **Network cost.**
+   Each successful ZIP inspection typically performs two small ranged GETs (EOCD tail + central directory). This is light, but with many ZIPs it adds up. Consider rate-limiting (`--sleep`) or batching.
+
+   ## Script Overview
 
 **Typical run:**
 

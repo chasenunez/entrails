@@ -45,6 +45,8 @@ import sys
 import time
 import logging
 from typing import Optional
+import io
+import zipfile
 
 try:
     import requests
@@ -111,6 +113,135 @@ def _safe_find_text(elem, tag):
     """Find subelement text or return empty string if not present."""
     child = elem.find(tag)
     return child.text if child is not None else ''
+
+
+def _parse_le_int(b: bytes) -> int:
+    """Parse little-endian unsigned integer from bytes (len 2 or 4)."""
+    return int.from_bytes(b, byteorder='little', signed=False)
+
+def _http_range_get(session: requests.Session, url: str, start: int, length: int, allow_full_fallback: bool = True):
+    """
+    Perform an HTTP ranged GET for bytes [start, start+length-1].
+    Returns bytes or raises.
+    If server responds with 200 (full content) and allow_full_fallback=True, returns entire content.
+    """
+    end = start + max(0, length) - 1
+    headers = {'Range': f'bytes={start}-{end}'}
+    resp = session.get(url, headers=headers, timeout=60)
+    # 206 Partial Content is expected; 200 may mean server ignored Range and returned full file
+    if resp.status_code in (200, 206):
+        return resp.content, resp.status_code
+    # Other statuses: raise for visibility
+    resp.raise_for_status()
+    return resp.content, resp.status_code
+
+# woof this one was a heavy lift. If it works, itll be a miracle.
+def inspect_zip_entries_remote(bucket_root_url: str, key: str, size: int, session: requests.Session,
+                              max_eocd_search: int = 1024*64,  # how many bytes to read from the end to find EOCD
+                              max_full_download: int = 1024*1024*50):
+    """
+    Inspect a remote ZIP accessible at bucket_root_url + key using ranged GETs.
+    Returns a list of dicts describing zip entries:
+      [{'filename': ..., 'compress_size': ..., 'file_size': ..., 'compress_type': ...}, ...]
+    Behavior:
+    - Try to fetch only EOCD and Central Directory via Range requests.
+    - If server ignores Range and returns full file (status 200) and file is small (<max_full_download),
+      we'll parse it as a normal zip.
+    - If ZIP64 or other unusual cases occur, function will fall back to safer behavior or return [].
+    """
+    full_url = bucket_root_url.rstrip('/') + '/' + key.lstrip('/')
+    entries = []
+
+    # 1) Read tail of file to find EOCD signature (0x06054b50)
+    #    EOCD record minimum size is 22 bytes; comment can extend it. ZIP64 requires special handling.
+    read_len = min(size, max_eocd_search)
+    start = max(0, size - read_len)
+    try:
+        tail_bytes, status = _http_range_get(session, full_url, start, read_len)
+    except Exception as e:
+        logger.warning("Range GET for EOCD failed for %s: %s", full_url, e)
+        return entries
+
+    # If server returned whole file (200) and file is small, hand to zipfile directly
+    if status == 200:
+        if len(tail_bytes) <= max_full_download:
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(tail_bytes))
+                for zi in zf.infolist():
+                    entries.append({'filename': zi.filename, 'compress_size': zi.compress_size,
+                                    'file_size': zi.file_size, 'compress_type': zi.compress_type})
+                return entries
+            except Exception as e:
+                logger.warning("Full-download parsing failed for %s: %s", full_url, e)
+                return entries
+        else:
+            logger.warning("Server ignored Range and file too large to download (%d bytes): %s", len(tail_bytes), full_url)
+            return entries
+
+    # Search for EOCD signature (last occurrence)
+    eocd_sig = b'PK\x05\x06'  # 0x06054b50 little-endian
+    idx = tail_bytes.rfind(eocd_sig)
+    if idx == -1:
+        # Possibly ZIP64 or EOCD beyond max_eocd_search. Try a larger read if feasible.
+        logger.warning("EOCD signature not found in last %d bytes of %s", read_len, full_url)
+        return entries
+
+    # EOCD structure (from signature position):
+    # offset 0: 4 bytes signature
+    # offset 4: 2 bytes disk number
+    # offset 6: 2 bytes disk with start of central dir
+    # offset 8: 2 bytes num entries on this disk
+    # offset 10: 2 bytes total entries
+    # offset 12: 4 bytes central directory size
+    # offset 16: 4 bytes central directory offset (start)
+    # offset 20: 2 bytes comment length
+    try:
+        eocd = tail_bytes[idx: idx + 22]
+        cd_size = _parse_le_int(eocd[12:16])
+        cd_start = _parse_le_int(eocd[16:20])
+    except Exception as e:
+        logger.warning("Failed to parse EOCD in %s: %s", full_url, e)
+        return entries
+
+    # 2) Fetch central directory
+    try:
+        cd_bytes, status2 = _http_range_get(session, full_url, cd_start, cd_size)
+    except Exception as e:
+        logger.warning("Failed to fetch central directory for %s: %s", full_url, e)
+        return entries
+
+    # If server returned full file (status2 == 200), and cd_bytes is whole file, parse via zipfile if small
+    if status2 == 200 and len(cd_bytes) <= max_full_download:
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(cd_bytes))
+            for zi in zf.infolist():
+                entries.append({'filename': zi.filename, 'compress_size': zi.compress_size,
+                                'file_size': zi.file_size, 'compress_type': zi.compress_type})
+            return entries
+        except Exception:
+            pass  # fall back to the next approach
+
+    # 3) Create a minimal fake zip by concatenating CD + EOCD and feed to ZipFile
+    try:
+        # We need full EOCD bytes; we extracted it from tail_bytes at idx.
+        full_eocd = tail_bytes[idx: idx + 22]
+        fakezip = io.BytesIO(cd_bytes + full_eocd)
+        zf = zipfile.ZipFile(fakezip)
+        for zi in zf.infolist():
+            entries.append({'filename': zi.filename, 'compress_size': zi.compress_size,
+                            'file_size': zi.file_size, 'compress_type': zi.compress_type})
+        return entries
+    except Exception as e:
+        logger.warning("Failed to build fake zip from CD+EOCD for %s: %s", full_url, e)
+        # Could be ZIP64 or other complicated cases; we skip in that case.
+        return entries
+
+
+
+
+
+
+
 
 # ----- Core: fetch/list S3-style bucket pages -----
 
@@ -195,6 +326,41 @@ def list_s3_bucket_to_csv(bucket_url: str, csv_writer: csv.DictWriter, session: 
                 'owner_display_name': owner_display,
                 'type': type_,
             })
+
+
+            # --- New: inspect remote ZIPs and list inner entries ---
+            # Only attempt for .zip files and when we have a valid numeric size
+            _, ext = os.path.splitext(key if key is not None else '')
+            ext = ext.lower()
+            try:
+                size_int = int(size) if (size is not None and str(size).strip() != '') else None
+            except Exception:
+                size_int = None
+
+            if ext == '.zip' and size_int is not None and size_int > 0:
+                try:
+                    inner_entries = inspect_zip_entries_remote(bucket_url, key, size_int, session)
+                    if inner_entries:
+                        logger.info("Found %d entries inside ZIP %s", len(inner_entries), key)
+                        for ie in inner_entries:
+                            inner_key = f"{key}::{ie['filename']}"
+                            # We reuse bucket-level metadata; for size we write compressed size
+                            csv_writer.writerow({
+                                'bucket_url': bucket_url,
+                                'bucket_name': bucket_name,
+                                'key': inner_key,
+                                'last_modified': last_modified,
+                                'etag': etag,
+                                'size': str(ie.get('compress_size', '')),
+                                'storage_class': storage_class,
+                                'owner_id': owner_id,
+                                'owner_display_name': owner_display,
+                                'type': type_,
+                            })
+                    else:
+                        logger.debug("No inner entries discovered (or skipped due to complexity) for ZIP %s", key)
+                except Exception as e:
+                    logger.warning("Error while inspecting ZIP %s: %s", key, e)
 
         page_count += 1
         # Pagination control: check <IsTruncated>
