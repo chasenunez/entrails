@@ -116,7 +116,7 @@ python3 entrails.py fetch --out all_s3_files.csv
 python3 entrails.py visualize --csv all_s3_files.csv --out-prefix envidat_viz
 
 #or do both
-python envidat_filetype_tool.py run-all --out all_s3_files.csv --out-prefix envidat_viz
+python3 entrails.py run-all --out all_s3_files.csv --out-prefix envidat_viz
 ```
 
 ## What you’ll see in the logs
