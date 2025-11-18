@@ -1,4 +1,4 @@
-# EnviDat Entrails for Exploring & Visualizing the data types on Envidat and Other S3 Buckets
+# EnviDat Entrails for Exploring & Visualizing the data types in S3 Buckets
 
 This script does three main things:
 
