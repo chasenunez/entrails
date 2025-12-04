@@ -58,8 +58,6 @@ the [inspiration](https://stackoverflow.com/questions/51351000/read-zip-files-fr
 
 No full-archive download required in the common case.
 
-## What the fetch step writes
-
 ### Original ZIP file row
 
 CSV columns remain the same as for normal objects:
