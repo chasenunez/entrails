@@ -1,4 +1,4 @@
-# EnviDat Entrails for Exploring & Visualizing the data types on Envidat
+# Entrails for Exploring & Visualizing the data types on Envidat
 
 This script does three main things:
 
@@ -13,7 +13,7 @@ You’ll get:
 
 ## Buckets Analyzed
 
-These are the five S3 endpoints we’re working with:
+For an example, let's look at the data repository for the Eidgenössische Forschungsanstalt für Wald, Schnee und Landschaft (WSL): EnviDat. These are the five S3 endpoints we’re working with:
 
 | Bucket | Description |
 |--------|--------------|
